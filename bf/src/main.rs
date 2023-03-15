@@ -1,5 +1,12 @@
+use codegen::Codegen;
+use parser::Parser;
+
+mod codegen;
 mod parser;
 
 fn main() {
-    println!("Hello, world!");
+    unsafe {
+        let codegen = Codegen::new(Parser::new("test"));
+        codegen.build();
+    }
 }

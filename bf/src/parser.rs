@@ -1,6 +1,6 @@
 use std::str::Chars;
 
-struct Parser<'c> {
+pub struct Parser<'c> {
     chars: Chars<'c>,
     current: char,
 }
