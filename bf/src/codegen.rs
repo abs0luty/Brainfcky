@@ -5,6 +5,7 @@ use std::ptr::null_mut;
 use llvm::core::{
     LLVMAddTargetDependentFunctionAttr, LLVMBuildAdd, LLVMBuildCall2, LLVMBuildGEP2,
     LLVMBuildLoad2, LLVMBuildRet, LLVMBuildStore, LLVMDisposeBuilder, LLVMGetNamedFunction,
+    LLVMPrintModuleToString,
 };
 use llvm::prelude::{LLVMBuilderRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
 use llvm::target::{LLVM_InitializeAllAsmPrinters, LLVM_InitializeAllDisassemblers};
@@ -33,6 +34,7 @@ use crate::parser::{Instruction, Parser};
 extern crate llvm_sys as llvm;
 
 pub struct Codegen<'c> {
+    filename: &'c str,
     parser: Parser<'c>,
     current_instruction: Instruction,
     ptr: LLVMValueRef,
@@ -55,7 +57,7 @@ macro_rules! from_cstr {
 }
 
 impl<'c> Codegen<'c> {
-    pub unsafe fn new(mut parser: Parser<'c>) -> Self {
+    pub unsafe fn new(filename: &'c str, mut parser: Parser<'c>) -> Self {
         LLVM_InitializeAllTargetInfos();
         LLVM_InitializeAllTargets();
         LLVM_InitializeAllTargetMCs();
@@ -127,6 +129,7 @@ impl<'c> Codegen<'c> {
         LLVMBuildStore(builder, data_ptr, ptr);
 
         Self {
+            filename,
             parser,
             current_instruction,
             ptr,
@@ -143,26 +146,6 @@ impl<'c> Codegen<'c> {
 
     unsafe fn codegen_for_next_instruction(&mut self) {
         match self.current_instruction {
-            Instruction::MoveRight => {
-                self.ptr = LLVMBuildGEP2(
-                    self.builder,
-                    LLVMPointerType(LLVMInt8Type(), 0),
-                    self.ptr,
-                    &mut LLVMConstInt(LLVMInt8Type(), 1, 0),
-                    1,
-                    cstr!("ptr"),
-                );
-            }
-            Instruction::MoveLeft => {
-                self.ptr = LLVMBuildGEP2(
-                    self.builder,
-                    LLVMPointerType(LLVMInt8Type(), 0),
-                    self.ptr,
-                    &mut LLVMConstInt(LLVMInt8Type(), u64::MAX, 1),
-                    1,
-                    cstr!("ptr"),
-                );
-            }
             Instruction::Output => {
                 LLVMBuildCall2(
                     self.builder,
@@ -178,6 +161,7 @@ impl<'c> Codegen<'c> {
                     1,
                     cstr!(""),
                 );
+                self.advance();
             }
             Instruction::Input => {
                 LLVMBuildStore(
@@ -192,30 +176,73 @@ impl<'c> Codegen<'c> {
                     ),
                     self.ptr,
                 );
+                self.advance();
             }
-            Instruction::Advance => {
-                LLVMBuildStore(
-                    self.builder,
-                    LLVMBuildAdd(
+            Instruction::Advance | Instruction::Decrease => {
+                let mut offset = if matches!(self.current_instruction, Instruction::Advance) {
+                    1
+                } else {
+                    u64::MAX
+                };
+
+                self.advance();
+
+                while matches!(
+                    self.current_instruction,
+                    Instruction::Advance | Instruction::Decrease
+                ) {
+                    offset += if matches!(self.current_instruction, Instruction::Advance) {
+                        1
+                    } else {
+                        u64::MAX
+                    };
+                    self.advance();
+                }
+
+                if offset != 0 {
+                    LLVMBuildStore(
                         self.builder,
-                        LLVMBuildLoad2(self.builder, LLVMInt8Type(), self.ptr, cstr!("")),
-                        LLVMConstInt(LLVMInt8Type(), 1, 0),
-                        cstr!(""),
-                    ),
-                    self.ptr,
-                );
+                        LLVMBuildAdd(
+                            self.builder,
+                            LLVMBuildLoad2(self.builder, LLVMInt8Type(), self.ptr, cstr!("")),
+                            LLVMConstInt(LLVMInt8Type(), offset, 0),
+                            cstr!(""),
+                        ),
+                        self.ptr,
+                    );
+                }
             }
-            Instruction::Decrease => {
-                LLVMBuildStore(
-                    self.builder,
-                    LLVMBuildAdd(
+            Instruction::MoveRight | Instruction::MoveLeft => {
+                let mut offset = if matches!(self.current_instruction, Instruction::MoveRight) {
+                    1
+                } else {
+                    u64::MAX
+                };
+
+                self.advance();
+
+                while matches!(
+                    self.current_instruction,
+                    Instruction::MoveRight | Instruction::MoveLeft
+                ) {
+                    offset += if matches!(self.current_instruction, Instruction::MoveRight) {
+                        1
+                    } else {
+                        u64::MAX
+                    };
+                    self.advance();
+                }
+
+                if offset != 0 {
+                    self.ptr = LLVMBuildGEP2(
                         self.builder,
-                        LLVMBuildLoad2(self.builder, LLVMInt8Type(), self.ptr, cstr!("")),
-                        LLVMConstInt(LLVMInt8Type(), u64::MAX, 0),
-                        cstr!(""),
-                    ),
-                    self.ptr,
-                );
+                        LLVMPointerType(LLVMInt8Type(), 0),
+                        self.ptr,
+                        &mut LLVMConstInt(LLVMInt8Type(), offset, 0),
+                        1,
+                        cstr!("ptr"),
+                    );
+                }
             }
             _ => {}
         }
@@ -224,12 +251,11 @@ impl<'c> Codegen<'c> {
     pub unsafe fn build(&mut self) {
         while self.current_instruction != Instruction::EndOfInput {
             self.codegen_for_next_instruction();
-            self.advance();
         }
 
         LLVMBuildRet(self.builder, LLVMConstInt(LLVMInt32Type(), 0, 1));
 
-        // println!("{}", from_cstr!(LLVMPrintModuleToString(self.module)));
+        println!("{}", from_cstr!(LLVMPrintModuleToString(self.module)));
 
         let target_triple = LLVMGetDefaultTargetTriple();
 
@@ -258,10 +284,12 @@ impl<'c> Codegen<'c> {
             LLVMCopyStringRepOfTargetData(LLVMCreateTargetDataLayout(target_machine)),
         );
 
+        let object_filename = format!("{}.o\0", self.filename);
+
         if LLVMTargetMachineEmitToFile(
             target_machine,
             self.module,
-            cstr!("output.o"),
+            object_filename.as_ptr() as *mut i8,
             llvm::target_machine::LLVMCodeGenFileType::LLVMObjectFile,
             &mut error,
         ) != 0
@@ -270,6 +298,8 @@ impl<'c> Codegen<'c> {
             LLVMDisposeMessage(error);
             exit(1);
         }
+
+        println!("Successfully compiled {}!", object_filename);
 
         LLVMDisposeTargetMachine(target_machine);
         LLVMDisposeBuilder(self.builder);
