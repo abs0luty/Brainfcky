@@ -6,7 +6,9 @@ mod parser;
 
 fn main() {
     unsafe {
-        let codegen = Codegen::new(Parser::new("test"));
+        println!("Building started...");
+        let mut codegen = Codegen::new(Parser::new(",><."));
         codegen.build();
+        println!("Finished!");
     }
 }

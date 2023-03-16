@@ -18,6 +18,7 @@ impl<'c> Parser<'c> {
     }
 }
 
+#[derive(PartialEq, Debug)]
 pub enum Instruction {
     MoveLeft,
     MoveRight,
@@ -30,25 +31,35 @@ pub enum Instruction {
     EndOfInput,
 }
 
+impl Default for Instruction {
+    fn default() -> Self {
+        Self::EndOfInput
+    }
+}
+
 impl<'c> Iterator for Parser<'c> {
     type Item = Instruction;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            match self.current {
-                '\0' => return Some(Instruction::EndOfInput),
-                '+' => return Some(Instruction::Advance),
-                '-' => return Some(Instruction::Decrease),
-                '>' => return Some(Instruction::MoveRight),
-                '<' => return Some(Instruction::MoveLeft),
-                '.' => return Some(Instruction::Output),
-                ',' => return Some(Instruction::Input),
-                '[' => return Some(Instruction::StartLoop),
-                ']' => return Some(Instruction::CloseLoop),
-                _ => {}
-            }
+            let instruction = match self.current {
+                '\0' => Some(Instruction::EndOfInput),
+                '+' => Some(Instruction::Advance),
+                '-' => Some(Instruction::Decrease),
+                '>' => Some(Instruction::MoveRight),
+                '<' => Some(Instruction::MoveLeft),
+                '.' => Some(Instruction::Output),
+                ',' => Some(Instruction::Input),
+                '[' => Some(Instruction::StartLoop),
+                ']' => Some(Instruction::CloseLoop),
+                _ => None,
+            };
 
             self.advance();
+
+            if instruction.is_some() {
+                return instruction;
+            }
         }
     }
 }

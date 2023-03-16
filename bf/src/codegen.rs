@@ -2,15 +2,19 @@ use std::ffi::CStr;
 use std::process::exit;
 use std::ptr::null_mut;
 
-use llvm::core::{LLVMBuildRet, LLVMDisposeBuilder};
+use llvm::core::{
+    LLVMAddTargetDependentFunctionAttr, LLVMBuildAdd, LLVMBuildCall2, LLVMBuildGEP2,
+    LLVMBuildLoad2, LLVMBuildRet, LLVMBuildStore, LLVMDisposeBuilder, LLVMGetNamedFunction,
+};
+use llvm::prelude::{LLVMBuilderRef, LLVMModuleRef, LLVMTypeRef, LLVMValueRef};
 use llvm::target::{LLVM_InitializeAllAsmPrinters, LLVM_InitializeAllDisassemblers};
 use llvm::target_machine::LLVMGetHostCPUFeatures;
 use llvm::{
     core::{
-        LLVMAddFunction, LLVMAppendBasicBlock, LLVMBuildAlloca, LLVMBuildCall2, LLVMBuildStore,
-        LLVMConstInt, LLVMCreateBuilder, LLVMDisposeMessage, LLVMDisposeModule, LLVMFunctionType,
-        LLVMGetNamedFunction, LLVMInt32Type, LLVMInt64Type, LLVMInt8Type, LLVMModuleCreateWithName,
-        LLVMPointerType, LLVMPositionBuilderAtEnd, LLVMSetDataLayout, LLVMSetTarget,
+        LLVMAddFunction, LLVMAppendBasicBlock, LLVMBuildAlloca, LLVMConstInt, LLVMCreateBuilder,
+        LLVMDisposeMessage, LLVMDisposeModule, LLVMFunctionType, LLVMInt32Type, LLVMInt64Type,
+        LLVMInt8Type, LLVMModuleCreateWithName, LLVMPointerType, LLVMPositionBuilderAtEnd,
+        LLVMSetDataLayout, LLVMSetTarget,
     },
     target::{
         LLVMCopyStringRepOfTargetData, LLVM_InitializeAllAsmParsers, LLVM_InitializeAllTargetInfos,
@@ -24,24 +28,34 @@ use llvm::{
     LLVMType,
 };
 
-use crate::parser::Parser;
+use crate::parser::{Instruction, Parser};
 
 extern crate llvm_sys as llvm;
 
 pub struct Codegen<'c> {
     parser: Parser<'c>,
-    module: *mut llvm::LLVMModule,
-    builder: *mut llvm::LLVMBuilder,
+    current_instruction: Instruction,
+    ptr: LLVMValueRef,
+    module: LLVMModuleRef,
+    builder: LLVMBuilderRef,
+    putchar_fn_type: LLVMTypeRef,
+    getchar_fn_type: LLVMTypeRef,
 }
 
 macro_rules! cstr {
     ($s: literal) => {
-        $s.as_ptr() as *mut i8
+        concat!($s, '\0').as_ptr() as *mut i8
+    };
+}
+
+macro_rules! from_cstr {
+    ($s: expr) => {
+        CStr::from_ptr($s).to_str().unwrap()
     };
 }
 
 impl<'c> Codegen<'c> {
-    pub unsafe fn new(parser: Parser<'c>) -> Self {
+    pub unsafe fn new(mut parser: Parser<'c>) -> Self {
         LLVM_InitializeAllTargetInfos();
         LLVM_InitializeAllTargets();
         LLVM_InitializeAllTargetMCs();
@@ -49,34 +63,62 @@ impl<'c> Codegen<'c> {
         LLVM_InitializeAllAsmPrinters();
         LLVM_InitializeAllDisassemblers();
 
-        let module = LLVMModuleCreateWithName(cstr!("main\0"));
+        let module = LLVMModuleCreateWithName(cstr!("main"));
 
         let builder = LLVMCreateBuilder();
 
-        let empty_array: [*mut LLVMType; 0] = [];
+        let current_instruction = parser.next().unwrap_or_default();
+
+        let calloc_fn_type = LLVMFunctionType(
+            LLVMPointerType(LLVMInt8Type(), 0),
+            [LLVMInt64Type(), LLVMInt64Type()].as_ptr() as *mut _,
+            2,
+            0,
+        );
+        let calloc = LLVMAddFunction(module, cstr!("calloc"), calloc_fn_type);
+
+        LLVMAddTargetDependentFunctionAttr(calloc, cstr!("unwind"), cstr!(""));
+        LLVMAddTargetDependentFunctionAttr(calloc, cstr!("noalias"), cstr!(""));
+
+        let putchar_fn_type =
+            LLVMFunctionType(LLVMInt32Type(), [LLVMInt32Type()].as_ptr() as *mut _, 1, 0);
+
+        LLVMAddFunction(module, cstr!("putchar"), putchar_fn_type);
+
+        let getchar_fn_type = LLVMFunctionType(
+            LLVMInt32Type(),
+            ([] as [*mut LLVMType; 0]).as_ptr() as *mut _,
+            0,
+            0,
+        );
+
+        LLVMAddFunction(module, cstr!("getchar"), putchar_fn_type);
 
         let main = LLVMAddFunction(
             module,
-            cstr!("main\0"),
-            LLVMFunctionType(LLVMInt32Type(), empty_array.as_ptr() as *mut _, 0, 0),
+            cstr!("main"),
+            LLVMFunctionType(
+                LLVMInt32Type(),
+                ([] as [*mut LLVMType; 0]).as_ptr() as *mut _,
+                0,
+                0,
+            ),
         );
 
-        LLVMPositionBuilderAtEnd(builder, LLVMAppendBasicBlock(main, cstr!("\0")));
+        LLVMPositionBuilderAtEnd(builder, LLVMAppendBasicBlock(main, cstr!("")));
 
-        let r#i8 = LLVMInt8Type();
-        let r#i64 = LLVMInt64Type();
-        let i8ptr = LLVMPointerType(r#i8, 0);
-
-        let data = LLVMBuildAlloca(builder, i8ptr, cstr!("data\0"));
-        let ptr = LLVMBuildAlloca(builder, i8ptr, cstr!("ptr\0"));
-
-        let calloc = LLVMGetNamedFunction(module, cstr!("calloc"));
+        let data = LLVMBuildAlloca(builder, LLVMPointerType(LLVMInt8Type(), 0), cstr!("data"));
+        let ptr = LLVMBuildAlloca(builder, LLVMPointerType(LLVMInt8Type(), 0), cstr!("ptr"));
 
         let data_ptr = LLVMBuildCall2(
             builder,
-            i8ptr,
+            calloc_fn_type,
             calloc,
-            [LLVMConstInt(r#i64, 30000, 0), LLVMConstInt(r#i64, 1, 0)].as_ptr() as *mut _,
+            [
+                LLVMConstInt(LLVMInt64Type(), 30000, 0),
+                LLVMConstInt(LLVMInt64Type(), 1, 0),
+            ]
+            .as_ptr() as *mut _,
             2,
             cstr!(""),
         );
@@ -84,23 +126,118 @@ impl<'c> Codegen<'c> {
         LLVMBuildStore(builder, data_ptr, data);
         LLVMBuildStore(builder, data_ptr, ptr);
 
-        LLVMBuildRet(builder, LLVMConstInt(LLVMInt32Type(), 0, 1));
-
         Self {
             parser,
+            current_instruction,
+            ptr,
             module,
             builder,
+            putchar_fn_type,
+            getchar_fn_type,
         }
     }
 
-    pub unsafe fn build(&self) {
+    fn advance(&mut self) {
+        self.current_instruction = self.parser.next().unwrap_or_default();
+    }
+
+    unsafe fn codegen_for_next_instruction(&mut self) {
+        match self.current_instruction {
+            Instruction::MoveRight => {
+                self.ptr = LLVMBuildGEP2(
+                    self.builder,
+                    LLVMPointerType(LLVMInt8Type(), 0),
+                    self.ptr,
+                    &mut LLVMConstInt(LLVMInt8Type(), 1, 0),
+                    1,
+                    cstr!("ptr"),
+                );
+            }
+            Instruction::MoveLeft => {
+                self.ptr = LLVMBuildGEP2(
+                    self.builder,
+                    LLVMPointerType(LLVMInt8Type(), 0),
+                    self.ptr,
+                    &mut LLVMConstInt(LLVMInt8Type(), u64::MAX, 1),
+                    1,
+                    cstr!("ptr"),
+                );
+            }
+            Instruction::Output => {
+                LLVMBuildCall2(
+                    self.builder,
+                    self.putchar_fn_type,
+                    LLVMGetNamedFunction(self.module, cstr!("putchar")),
+                    [LLVMBuildLoad2(
+                        self.builder,
+                        LLVMInt8Type(),
+                        self.ptr,
+                        cstr!(""),
+                    )]
+                    .as_ptr() as *mut _,
+                    1,
+                    cstr!(""),
+                );
+            }
+            Instruction::Input => {
+                LLVMBuildStore(
+                    self.builder,
+                    LLVMBuildCall2(
+                        self.builder,
+                        self.getchar_fn_type,
+                        LLVMGetNamedFunction(self.module, cstr!("getchar")),
+                        ([] as [LLVMValueRef; 0]).as_ptr() as *mut _,
+                        0,
+                        cstr!(""),
+                    ),
+                    self.ptr,
+                );
+            }
+            Instruction::Advance => {
+                LLVMBuildStore(
+                    self.builder,
+                    LLVMBuildAdd(
+                        self.builder,
+                        LLVMBuildLoad2(self.builder, LLVMInt8Type(), self.ptr, cstr!("")),
+                        LLVMConstInt(LLVMInt8Type(), 1, 0),
+                        cstr!(""),
+                    ),
+                    self.ptr,
+                );
+            }
+            Instruction::Decrease => {
+                LLVMBuildStore(
+                    self.builder,
+                    LLVMBuildAdd(
+                        self.builder,
+                        LLVMBuildLoad2(self.builder, LLVMInt8Type(), self.ptr, cstr!("")),
+                        LLVMConstInt(LLVMInt8Type(), u64::MAX, 0),
+                        cstr!(""),
+                    ),
+                    self.ptr,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    pub unsafe fn build(&mut self) {
+        while self.current_instruction != Instruction::EndOfInput {
+            self.codegen_for_next_instruction();
+            self.advance();
+        }
+
+        LLVMBuildRet(self.builder, LLVMConstInt(LLVMInt32Type(), 0, 1));
+
+        // println!("{}", from_cstr!(LLVMPrintModuleToString(self.module)));
+
         let target_triple = LLVMGetDefaultTargetTriple();
 
         let mut target: LLVMTargetRef = null_mut();
         let mut error: *mut i8 = null_mut();
 
         if LLVMGetTargetFromTriple(target_triple, &mut target, &mut error) != 0 {
-            println!("{}", CStr::from_ptr(error).to_str().unwrap());
+            println!("{}", from_cstr!(error));
             LLVMDisposeMessage(error);
             exit(1);
         }
@@ -108,9 +245,9 @@ impl<'c> Codegen<'c> {
         let target_machine = LLVMCreateTargetMachine(
             target,
             target_triple,
-            cstr!("generic\0"),
+            cstr!("generic"),
             LLVMGetHostCPUFeatures(),
-            LLVMCodeGenOptLevel::LLVMCodeGenLevelAggressive,
+            LLVMCodeGenOptLevel::LLVMCodeGenLevelDefault,
             llvm::target_machine::LLVMRelocMode::LLVMRelocDefault,
             LLVMCodeModel::LLVMCodeModelDefault,
         );
@@ -124,12 +261,12 @@ impl<'c> Codegen<'c> {
         if LLVMTargetMachineEmitToFile(
             target_machine,
             self.module,
-            cstr!("output.o\0"),
+            cstr!("output.o"),
             llvm::target_machine::LLVMCodeGenFileType::LLVMObjectFile,
             &mut error,
         ) != 0
         {
-            println!("{}", CStr::from_ptr(error).to_str().unwrap());
+            println!("{}", from_cstr!(error));
             LLVMDisposeMessage(error);
             exit(1);
         }
